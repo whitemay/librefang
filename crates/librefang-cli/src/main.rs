@@ -2207,7 +2207,7 @@ fn format_local_timestamp() -> String {
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as libc::time_t;
+            .as_secs() as i64;
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         // SAFETY: localtime_r is thread-safe and writes into our stack buffer.
         unsafe { libc::localtime_r(&secs, &mut tm) };

@@ -818,9 +818,9 @@ pub async fn list_agents(
 
     // -- Filtering --
     // Exclude hand agents by default; pass ?include_hands=true to include them.
-    if !params.include_hands.unwrap_or(false) {
-        agents.retain(|e| !e.is_hand);
-    }
+    // if !params.include_hands.unwrap_or(false) {
+    //     agents.retain(|e| !e.is_hand);
+    // }
 
     if let Some(ref q) = params.q {
         let q_lower = q.to_lowercase();

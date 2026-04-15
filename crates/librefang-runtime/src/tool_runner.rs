@@ -1850,6 +1850,18 @@ async fn tool_file_write(
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let resolved = resolve_file_path(raw_path, workspace_root)?;
+
+    // SECURITY: Reject writing to manifest files to prevent agents from self-modifying.
+    if let Some(filename) = resolved.file_name().and_then(|f| f.to_str()) {
+        let lower = filename.to_lowercase();
+        if lower == "agent.toml" || lower == "HAND.toml" {
+            return Err(format!(
+                "Access denied: modification of manifest file '{}' is forbidden",
+                filename
+            ));
+        }
+    }
+
     let content = input["content"]
         .as_str()
         .ok_or("Missing 'content' parameter")?;
@@ -1908,6 +1920,37 @@ async fn tool_apply_patch(
     let patch_str = input["patch"].as_str().ok_or("Missing 'patch' parameter")?;
     let root = workspace_root.ok_or("apply_patch requires a workspace root")?;
     let ops = crate::apply_patch::parse_patch(patch_str)?;
+
+    // SECURITY: Check all operations for manifest file modifications.
+    for op in &ops {
+        let paths = match op {
+            crate::apply_patch::PatchOp::AddFile { path, .. } => vec![path.as_str()],
+            crate::apply_patch::PatchOp::UpdateFile { path, move_to, .. } => {
+                let mut p = vec![path.as_str()];
+                if let Some(m) = move_to {
+                    p.push(m.as_str());
+                }
+                p
+            }
+            crate::apply_patch::PatchOp::DeleteFile { path } => vec![path.as_str()],
+        };
+
+        for raw_path in paths {
+            // Resolve the path to see what it actually points to
+            if let Ok(resolved) = crate::workspace_sandbox::resolve_sandbox_path(raw_path, root) {
+                if let Some(filename) = resolved.file_name().and_then(|f| f.to_str()) {
+                    let lower = filename.to_lowercase();
+                    if lower == "agent.toml" || lower == "HAND.toml" {
+                        return Err(format!(
+                            "Access denied: modification of manifest file '{}' is forbidden",
+                            filename
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     let result = crate::apply_patch::apply_patch(&ops, root).await;
     if result.is_ok() {
         Ok(result.summary())
@@ -2010,15 +2053,45 @@ async fn tool_web_search_legacy(input: &serde_json::Value) -> Result<String, Str
 // Shell tool
 // ---------------------------------------------------------------------------
 
+async fn rewrite_command_with_rtk(command: &str) -> Option<String> {
+    // SECURITY: Use a short timeout for the rewrite helper to prevent hanging the agent loop.
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::process::Command::new("rtk")
+            .arg("rewrite")
+            .arg(command)
+            .output(),
+    )
+    .await;
+
+    match output {
+        Ok(Ok(out)) if out.status.success() => {
+            let rewritten = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !rewritten.is_empty() {
+                return Some(rewritten);
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 async fn tool_shell_exec(
     input: &serde_json::Value,
     allowed_env: &[String],
     workspace_root: Option<&Path>,
     exec_policy: Option<&librefang_types::config::ExecPolicy>,
 ) -> Result<String, String> {
-    let command = input["command"]
+    let original_command = input["command"]
         .as_str()
         .ok_or("Missing 'command' parameter")?;
+
+    // Try to rewrite the command with rtk for token optimization (e.g. git status -> rtk git status)
+    let command_str = rewrite_command_with_rtk(original_command)
+        .await
+        .unwrap_or_else(|| original_command.to_string());
+    let command = &command_str;
+
     // Use LLM-specified timeout, or fall back to exec policy timeout, or default 30s
     let policy_timeout = exec_policy.map(|p| p.timeout_secs).unwrap_or(30);
     let timeout_secs = input["timeout_seconds"].as_u64().unwrap_or(policy_timeout);
