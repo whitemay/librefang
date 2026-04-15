@@ -4,9 +4,10 @@
 //! with alias resolution, auth status detection, and pricing lookups.
 
 use librefang_types::model_catalog::{
-    AliasesCatalogFile, AuthStatus, ModelCatalogEntry, ModelCatalogFile, ModelTier, ProviderInfo,
+    AliasesCatalogFile, AuthStatus, ModelCatalogEntry, ModelCatalogFile, ModelOverrides, ModelTier,
+    ProviderInfo,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::warn;
 
 /// The model catalog — registry of all known models and providers.
@@ -14,6 +15,11 @@ pub struct ModelCatalog {
     models: Vec<ModelCatalogEntry>,
     aliases: HashMap<String, String>,
     providers: Vec<ProviderInfo>,
+    /// Providers whose fallback/CLI detection is suppressed by the user
+    /// (i.e. the user explicitly removed the key via the dashboard).
+    suppressed_providers: HashSet<String>,
+    /// Per-model inference parameter overrides, keyed by "provider:model_id".
+    overrides: HashMap<String, ModelOverrides>,
 }
 
 impl ModelCatalog {
@@ -151,6 +157,8 @@ impl ModelCatalog {
             models,
             aliases,
             providers,
+            suppressed_providers: HashSet::new(),
+            overrides: HashMap::new(),
         }
     }
 
@@ -192,26 +200,40 @@ impl ModelCatalog {
             // Primary: check the provider's declared env var (non-empty after trim)
             let has_key = std::env::var(&provider.api_key_env).is_ok_and(|v| !v.trim().is_empty());
 
+            // If the user explicitly removed this provider's key, skip
+            // fallback/CLI detection — only honour the primary env var.
+            let suppressed = self.suppressed_providers.contains(&provider.id);
+
             // Secondary: provider-specific fallback keys (still API-key-based auth)
-            let has_key_fallback = match provider.id.as_str() {
-                "gemini" => std::env::var("GOOGLE_API_KEY").is_ok_and(|v| !v.trim().is_empty()),
-                "openai" | "codex" => {
-                    std::env::var("OPENAI_API_KEY").is_ok_and(|v| !v.trim().is_empty())
-                        || read_codex_credential().is_some()
+            let has_key_fallback = if suppressed {
+                false
+            } else {
+                match provider.id.as_str() {
+                    "gemini" => std::env::var("GOOGLE_API_KEY").is_ok_and(|v| !v.trim().is_empty()),
+                    "openai" | "codex" => {
+                        std::env::var("OPENAI_API_KEY").is_ok_and(|v| !v.trim().is_empty())
+                            || read_codex_credential().is_some()
+                    }
+                    _ => false,
                 }
-                _ => false,
             };
 
             // Tertiary: CLI tools that can serve as fallback for API providers
-            let aider_ok = || crate::drivers::cli_provider_available("aider");
-            let has_cli_fallback = match provider.id.as_str() {
-                "anthropic" => crate::drivers::cli_provider_available("claude-code") || aider_ok(),
-                "gemini" => crate::drivers::cli_provider_available("gemini-cli") || aider_ok(),
-                "openai" | "codex" => {
-                    crate::drivers::cli_provider_available("codex-cli") || aider_ok()
+            let has_cli_fallback = if suppressed {
+                false
+            } else {
+                let aider_ok = || crate::drivers::cli_provider_available("aider");
+                match provider.id.as_str() {
+                    "anthropic" => {
+                        crate::drivers::cli_provider_available("claude-code") || aider_ok()
+                    }
+                    "gemini" => crate::drivers::cli_provider_available("gemini-cli") || aider_ok(),
+                    "openai" | "codex" => {
+                        crate::drivers::cli_provider_available("codex-cli") || aider_ok()
+                    }
+                    "qwen" => crate::drivers::cli_provider_available("qwen-code") || aider_ok(),
+                    _ => false,
                 }
-                "qwen" => crate::drivers::cli_provider_available("qwen-code") || aider_ok(),
-                _ => false,
             };
 
             provider.auth_status = if has_key {
@@ -397,6 +419,86 @@ impl ModelCatalog {
         self.aliases.remove(&alias.to_lowercase()).is_some()
     }
 
+    /// Mark a provider as suppressed — fallback/CLI detection will be skipped
+    /// for this provider until `unsuppress_provider` is called.
+    pub fn suppress_provider(&mut self, id: &str) {
+        self.suppressed_providers.insert(id.to_string());
+    }
+
+    /// Remove a provider from the suppressed set, re-enabling fallback/CLI detection.
+    pub fn unsuppress_provider(&mut self, id: &str) {
+        self.suppressed_providers.remove(id);
+    }
+
+    /// Load the suppressed-providers list from a JSON file.
+    pub fn load_suppressed(&mut self, path: &std::path::Path) {
+        if let Ok(data) = std::fs::read_to_string(path) {
+            if let Ok(list) = serde_json::from_str::<Vec<String>>(&data) {
+                self.suppressed_providers = list.into_iter().collect();
+            }
+        }
+    }
+
+    /// Persist the suppressed-providers list to a JSON file.
+    /// Removes the file when the set is empty.
+    pub fn save_suppressed(&self, path: &std::path::Path) {
+        if self.suppressed_providers.is_empty() {
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+        let mut list: Vec<&String> = self.suppressed_providers.iter().collect();
+        list.sort();
+        if let Ok(json) = serde_json::to_string_pretty(&list) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    // ── Per-model overrides ──────────────────────────────────────────
+
+    /// Get inference parameter overrides for a model.
+    /// Key format: "provider:model_id".
+    pub fn get_overrides(&self, key: &str) -> Option<&ModelOverrides> {
+        self.overrides.get(key)
+    }
+
+    /// Set inference parameter overrides for a model.
+    /// Removes the entry if `overrides.is_empty()`.
+    pub fn set_overrides(&mut self, key: String, overrides: ModelOverrides) {
+        if overrides.is_empty() {
+            self.overrides.remove(&key);
+        } else {
+            self.overrides.insert(key, overrides);
+        }
+    }
+
+    /// Remove inference parameter overrides for a model.
+    pub fn remove_overrides(&mut self, key: &str) -> bool {
+        self.overrides.remove(key).is_some()
+    }
+
+    /// Load model overrides from a JSON file.
+    pub fn load_overrides(&mut self, path: &std::path::Path) {
+        if let Ok(data) = std::fs::read_to_string(path) {
+            if let Ok(map) = serde_json::from_str::<HashMap<String, ModelOverrides>>(&data) {
+                self.overrides = map;
+            }
+        }
+    }
+
+    /// Persist model overrides to a JSON file.
+    /// Removes the file when no overrides are set.
+    pub fn save_overrides(&self, path: &std::path::Path) -> Result<(), String> {
+        if self.overrides.is_empty() {
+            let _ = std::fs::remove_file(path);
+            return Ok(());
+        }
+        let json = serde_json::to_string_pretty(&self.overrides)
+            .map_err(|e| format!("Failed to serialize model overrides: {e}"))?;
+        std::fs::write(path, json)
+            .map_err(|e| format!("Failed to write model overrides file: {e}"))?;
+        Ok(())
+    }
+
     /// Set a custom base URL for a provider, overriding the default.
     ///
     /// Returns `true` if the provider was found and updated.
@@ -421,6 +523,7 @@ impl ModelCatalog {
                 available_models: Vec::new(),
                 // Added at runtime via set_provider_url → always custom.
                 is_custom: true,
+                proxy_url: None,
             });
             // Re-detect auth for the newly added provider
             self.detect_auth();
@@ -444,6 +547,24 @@ impl ModelCatalog {
                     }
                 }
             }
+        }
+    }
+
+    /// Set a per-provider proxy URL override.
+    pub fn set_provider_proxy_url(&mut self, provider: &str, proxy_url: &str) {
+        if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider) {
+            p.proxy_url = if proxy_url.is_empty() {
+                None
+            } else {
+                Some(proxy_url.to_string())
+            };
+        }
+    }
+
+    /// Apply a batch of per-provider proxy URL overrides from config.
+    pub fn apply_proxy_url_overrides(&mut self, overrides: &HashMap<String, String>) {
+        for (provider, proxy_url) in overrides {
+            self.set_provider_proxy_url(provider, proxy_url);
         }
     }
 
