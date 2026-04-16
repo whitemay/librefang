@@ -1350,7 +1350,7 @@ impl LibreFangKernel {
             .unwrap_or_else(|| config.data_dir.join("librefang.db"));
         let mut substrate = MemorySubstrate::open_with_chunking(
             &db_path,
-            config.memory.decay_rate,
+            config.memory.decay_rate as f32,
             config.memory.chunking.clone(),
         )
         .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?;
@@ -8023,11 +8023,14 @@ system_prompt = "You are a helpful assistant."
                             error = result.error.as_deref().unwrap_or("unknown"),
                             "Local provider offline"
                         );
-                        // Mark unreachable local providers so dashboard doesn't show "configured"
+                        // Mark unreachable local providers as LocalOffline (not Missing).
+                        // Using Missing would cause detect_auth() to reset the status back
+                        // to NotRequired on the next unrelated auth check, making offline
+                        // providers reappear in the model switcher.
                         if let Ok(mut catalog) = kernel.model_catalog.write() {
                             catalog.set_provider_auth_status(
                                 provider_id,
-                                librefang_types::model_catalog::AuthStatus::Missing,
+                                librefang_types::model_catalog::AuthStatus::LocalOffline,
                             );
                         }
                     }
@@ -8994,7 +8997,10 @@ system_prompt = "You are a helpful assistant."
     }
 
     /// Connect to all configured MCP servers and cache their tool definitions.
-    async fn connect_mcp_servers(self: &Arc<Self>) {
+    ///
+    /// Idempotent: servers that already have a live connection are skipped.
+    /// Called at boot and after hot-reload adds/updates MCP server config.
+    pub async fn connect_mcp_servers(self: &Arc<Self>) {
         use librefang_runtime::mcp::{McpConnection, McpServerConfig, McpTransport};
         use librefang_types::config::McpTransportEntry;
 
@@ -9005,6 +9011,14 @@ system_prompt = "You are a helpful assistant."
             .unwrap_or_default();
 
         for server_config in &servers {
+            // Skip servers that already have a live connection (idempotent).
+            {
+                let conns = self.mcp_connections.lock().await;
+                if conns.iter().any(|c| c.name() == server_config.name) {
+                    continue;
+                }
+            }
+
             let transport_entry = match &server_config.transport {
                 Some(t) => t,
                 None => {
@@ -9038,6 +9052,7 @@ system_prompt = "You are a helpful assistant."
                 headers: server_config.headers.clone(),
                 oauth_provider: Some(self.oauth_provider_ref()),
                 oauth_config: server_config.oauth.clone(),
+                taint_scanning: server_config.taint_scanning,
             };
 
             match McpConnection::connect(mcp_config).await {
@@ -9095,6 +9110,29 @@ system_prompt = "You are a helpful assistant."
                 self.mcp_connections.lock().await.len()
             );
         }
+    }
+
+    /// Disconnect an MCP server by name, removing it from the live connection list.
+    ///
+    /// The dropped `McpConnection` will shut down the underlying transport.
+    /// Returns `true` if a connection was found and removed.
+    pub async fn disconnect_mcp_server(&self, name: &str) -> bool {
+        let mut conns = self.mcp_connections.lock().await;
+        let before = conns.len();
+        conns.retain(|c| c.name() != name);
+        let removed = conns.len() < before;
+        if removed {
+            // Remove cached tools from this server and bump generation.
+            // MCP tools are prefixed: mcp_{normalized_server_name}_{tool_name}
+            let prefix = format!("mcp_{}_", librefang_runtime::mcp::normalize_name(name));
+            if let Ok(mut tools) = self.mcp_tools.lock() {
+                tools.retain(|t| !t.name.starts_with(&prefix));
+            }
+            self.mcp_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            info!(server = %name, "MCP server disconnected");
+        }
+        removed
     }
 
     /// Watch for OAuth completion by polling the vault for a stored access token.
@@ -9163,6 +9201,7 @@ system_prompt = "You are a helpful assistant."
             headers: server_config.headers.clone(),
             oauth_provider: Some(self.oauth_provider_ref()),
             oauth_config: server_config.oauth.clone(),
+            taint_scanning: server_config.taint_scanning,
         };
 
         match McpConnection::connect(mcp_config).await {
@@ -9297,6 +9336,7 @@ system_prompt = "You are a helpful assistant."
                 headers: server_config.headers.clone(),
                 oauth_provider: Some(self.oauth_provider_ref()),
                 oauth_config: server_config.oauth.clone(),
+                taint_scanning: server_config.taint_scanning,
             };
 
             self.extension_health.register(&server_config.name);
@@ -9443,6 +9483,7 @@ system_prompt = "You are a helpful assistant."
             headers: server_config.headers.clone(),
             oauth_provider: Some(self.oauth_provider_ref()),
             oauth_config: server_config.oauth.clone(),
+            taint_scanning: server_config.taint_scanning,
         };
 
         match McpConnection::connect(mcp_config).await {
