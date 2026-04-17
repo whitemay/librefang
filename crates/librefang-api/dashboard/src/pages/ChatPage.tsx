@@ -671,8 +671,8 @@ const MessageBubble = memo(function MessageBubble({ message, usageFooter, onCopy
               />
             </button>
             {thinkingExpanded && (
-              <div className="mt-1 px-3 py-2 rounded-lg border border-border-subtle bg-surface/50 text-[12px] leading-relaxed text-text-dim whitespace-pre-wrap break-words">
-                {message.thinking}
+              <div className="mt-1 px-3 py-2 rounded-lg border border-border-subtle bg-surface/50 text-[12px] leading-relaxed text-text-dim break-words prose-sm">
+                <MarkdownContent>{message.thinking ?? ""}</MarkdownContent>
               </div>
             )}
           </div>
@@ -803,7 +803,7 @@ const MessageBubble = memo(function MessageBubble({ message, usageFooter, onCopy
 });
 
 // Input box - with shortcut hints
-function ChatInput({ onSend, disabled, placeholder, authMissing, providerName, supportsThinking, sttAvailable }: { onSend: (msg: string) => void; disabled: boolean; placeholder: string; authMissing?: boolean; providerName?: string; supportsThinking?: boolean; sttAvailable?: boolean }) {
+function ChatInput({ onSend, disabled, placeholder, authMissing, authStatus, providerName, supportsThinking, sttAvailable }: { onSend: (msg: string) => void; disabled: boolean; placeholder: string; authMissing?: boolean; authStatus?: string; providerName?: string; supportsThinking?: boolean; sttAvailable?: boolean }) {
   const { t } = useTranslation();
   const [message, setMessage] = useState("");
   const [activeIndex, setActiveIndex] = useState(-1);
@@ -912,7 +912,9 @@ function ChatInput({ onSend, disabled, placeholder, authMissing, providerName, s
       {authMissing && (
         <div className="flex items-center gap-2 rounded-xl border border-warning/30 bg-warning/5 px-4 py-2.5 text-sm text-warning">
           <AlertCircle className="h-4 w-4 flex-shrink-0" />
-          <span>{t("chat.auth_missing", { provider: providerName || "unknown" })}</span>
+          <span>{authStatus === "local_offline"
+            ? t("chat.provider_offline", { provider: providerName || "unknown" })
+            : t("chat.auth_missing", { provider: providerName || "unknown" })}</span>
         </div>
       )}
       {/* Slash command autocomplete */}
@@ -1499,6 +1501,10 @@ function ApprovalCard({ approval, onResolved }: { approval: ApprovalItem; onReso
 
   const rs = riskStyle(approval.risk_level);
 
+  const riskLabel = approval.risk_level
+    ? t(`chat.approval_risk_${approval.risk_level}`, { defaultValue: approval.risk_level })
+    : null;
+
   return (
     <div className={`mx-auto w-full max-w-lg rounded-2xl border ${rs.border} ${rs.bg} p-4 shadow-lg animate-fade-in-up`}>
       {/* Header */}
@@ -1507,21 +1513,21 @@ function ApprovalCard({ approval, onResolved }: { approval: ApprovalItem; onReso
         <span className={`text-xs font-black uppercase tracking-widest ${rs.text}`}>
           {t("chat.approval_required")}
         </span>
-        {approval.risk_level && (
+        {riskLabel && (
           <span className={`ml-auto text-[10px] font-bold uppercase px-2 py-0.5 rounded-full ${rs.bg} ${rs.text} border ${rs.border}`}>
-            {approval.risk_level}
+            {riskLabel}
           </span>
         )}
       </div>
 
       {/* Tool info */}
-      <div className="space-y-1 mb-4">
+      <div className="space-y-2 mb-4">
         <div className="flex items-center gap-2">
           <span className="text-[10px] font-bold uppercase text-text-dim tracking-wider">{t("chat.approval_tool")}</span>
           <code className="text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-main">{approval.tool_name || "unknown"}</code>
         </div>
         {(approval.description || approval.action_summary || approval.action) && (
-          <p className="text-sm text-text-dim leading-relaxed">
+          <p className="text-xs text-text-dim leading-relaxed bg-main/50 rounded-lg px-3 py-2 font-mono whitespace-pre-wrap break-all">
             {approval.description || approval.action_summary || approval.action}
           </p>
         )}
@@ -2055,6 +2061,7 @@ export function ChatPage() {
               disabled={isLoading}
               placeholder={isLoading ? t("chat.generating") : selectedAgentId ? t("chat.input_placeholder_with_agent", { name: selectedAgent?.name }) : t("chat.transmit_command")}
               authMissing={isAuthUnavailable(selectedAgent?.auth_status)}
+              authStatus={selectedAgent?.auth_status}
               providerName={selectedAgent?.model_provider}
               supportsThinking={selectedAgent?.supports_thinking}
               sttAvailable={sttAvailable}
