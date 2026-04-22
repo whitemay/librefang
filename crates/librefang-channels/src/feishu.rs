@@ -17,6 +17,7 @@
 
 use crate::types::{
     split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
+    LifecycleReaction,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -158,6 +159,9 @@ pub struct FeishuAdapter {
     /// Event dedup cache — maps event_id → first-seen Instant.
     /// Prevents duplicate processing when Feishu retries webhook/WS events.
     seen_events: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Last processed create_time (timestamp) per chat session.
+    /// If a new message's create_time <= last_chat_timestamps[chat_id], it is discarded.
+    last_chat_timestamps: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl FeishuAdapter {
@@ -183,6 +187,7 @@ impl FeishuAdapter {
             shutdown_rx,
             cached_token: Arc::new(RwLock::new(None)),
             seen_events: Arc::new(Mutex::new(HashMap::new())),
+            last_chat_timestamps: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -435,6 +440,7 @@ impl FeishuAdapter {
         let verification_token = Arc::new(self.verification_token.clone());
         let encrypt_key = Arc::new(self.encrypt_key.clone());
         let seen_events = Arc::clone(&self.seen_events);
+        let last_chat_timestamps = Arc::clone(&self.last_chat_timestamps);
         let account_id = Arc::new(self.account_id.clone());
         let label = self.region.label();
         let region = self.region;
@@ -447,11 +453,13 @@ impl FeishuAdapter {
                 let ek = Arc::clone(&encrypt_key);
                 let tx = Arc::clone(&tx);
                 let seen = Arc::clone(&seen_events);
+                let last_ts = Arc::clone(&last_chat_timestamps);
                 move |body: axum::extract::Json<serde_json::Value>| {
                     let vt = Arc::clone(&vt);
                     let ek = Arc::clone(&ek);
                     let tx = Arc::clone(&tx);
                     let seen = Arc::clone(&seen);
+                    let last_ts = Arc::clone(&last_ts);
                     async move {
                         let payload = match decrypt_feishu_payload_if_needed(&body.0, ek.as_deref())
                         {
@@ -488,6 +496,15 @@ impl FeishuAdapter {
                         // Deduplicate by event_id
                         if is_duplicate_event(&payload, &seen) {
                             debug!("{label}: duplicate event, skipping");
+                            return (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({})),
+                            );
+                        }
+
+                        // Check for stale events (create_time <= last processed for this chat)
+                        if is_stale_event(&payload, &last_ts) {
+                            debug!("{label}: stale event (older create_time), skipping");
                             return (
                                 axum::http::StatusCode::OK,
                                 axum::Json(serde_json::json!({})),
@@ -547,6 +564,7 @@ impl FeishuAdapter {
         let account_id = Arc::new(self.account_id.clone());
         let client = self.client.clone();
         let seen_events = Arc::clone(&self.seen_events);
+        let last_chat_timestamps = Arc::clone(&self.last_chat_timestamps);
 
         tokio::spawn(async move {
             let label = region.label();
@@ -642,6 +660,12 @@ impl FeishuAdapter {
                                         continue;
                                     }
 
+                                    // Check for stale events
+                                    if is_stale_event(&payload, &last_chat_timestamps) {
+                                        debug!("{label}: WS stale event, skipping");
+                                        continue;
+                                    }
+
                                     // The WS gateway wraps the normal event callback
                                     // in an envelope: { "header": {...}, "event": {...} }
                                     // which matches the v2 schema.
@@ -701,6 +725,12 @@ impl FeishuAdapter {
 
                                         if is_duplicate_event(&payload, &seen_events) {
                                             debug!("{label}: WS binary duplicate event, skipping");
+                                            continue;
+                                        }
+
+                                        // Check for stale events
+                                        if is_stale_event(&payload, &last_chat_timestamps) {
+                                            debug!("{label}: WS binary stale event, skipping");
                                             continue;
                                         }
 
@@ -1125,6 +1155,46 @@ fn parse_card_action(event: &serde_json::Value, region: FeishuRegion) -> Option<
     })
 }
 
+/// Check whether an event is stale based on its create_time (timestamp).
+///
+/// Returns `true` if the event's create_time is less than or equal to the
+/// last processed timestamp for the same chat session.
+fn is_stale_event(payload: &serde_json::Value, last_times: &Mutex<HashMap<String, u64>>) -> bool {
+    // 1. Extract create_time from header (milliseconds string or number)
+    let create_time = payload["header"]["create_time"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| payload["header"]["create_time"].as_u64());
+
+    let Some(ts) = create_time else {
+        // No create_time in header (e.g. V1 events or non-event payloads)
+        // Fall back to accepting it.
+        return false;
+    };
+
+    // 2. Extract chat_id from event.message or event.open_chat_id
+    let chat_id = payload["event"]["message"]["chat_id"]
+        .as_str()
+        .or_else(|| payload["event"]["open_chat_id"].as_str());
+
+    let Some(chat_id) = chat_id else {
+        // No chat_id found — cannot apply sequence filtering.
+        return false;
+    };
+
+    let mut map = last_times.lock().unwrap_or_else(|e| e.into_inner());
+    let last = map.get(chat_id).cloned().unwrap_or(0);
+
+    if ts <= last {
+        // Stale or duplicate timestamp for this session.
+        return true;
+    }
+
+    // Newest message for this session — update high-water mark.
+    map.insert(chat_id.to_string(), ts);
+    false
+}
+
 /// Check whether an event has already been processed (by its `event_id` header).
 ///
 /// Returns `true` if the event is a duplicate that should be skipped.
@@ -1469,6 +1539,44 @@ impl ChannelAdapter for FeishuAdapter {
         _user: &ChannelUser,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Feishu/Lark does not support typing indicators via REST API
+        Ok(())
+    }
+
+    async fn send_reaction(
+        &self,
+        _user: &ChannelUser,
+        message_id: &str,
+        _reaction: &LifecycleReaction,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let label = self.region.label();
+        let token = self.get_token().await?;
+        let url = format!(
+            "{}/open-apis/im/v1/messages/{}/reactions",
+            self.region.api_base(),
+            message_id
+        );
+
+        // Always reply with "OK" emoji as requested
+        let body = serde_json::json!({
+            "reaction_type": {
+                "emoji_type": "OK"
+            }
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let resp_body = resp.text().await.unwrap_or_default();
+            debug!("{label} send reaction error {status}: {resp_body}");
+        }
+
         Ok(())
     }
 

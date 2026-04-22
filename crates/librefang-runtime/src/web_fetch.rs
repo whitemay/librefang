@@ -102,7 +102,11 @@ impl WebFetchEngine {
         };
         req = req.header(
             "User-Agent",
-            format!("Mozilla/5.0 (compatible; {})", crate::USER_AGENT),
+            format!(
+                "Mozilla/5.0 (compatible; {})",
+                std::env::var("LIBREFANG_USER_AGENT")
+                    .unwrap_or_else(|_| crate::USER_AGENT.to_string())
+            ),
         );
 
         // Add custom headers

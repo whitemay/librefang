@@ -201,7 +201,9 @@ pub fn new_client() -> reqwest::Client {
 pub fn build_http_client(proxy: &ProxyConfig) -> reqwest::ClientBuilder {
     let mut builder = reqwest::Client::builder()
         .use_preconfigured_tls(tls_config())
-        .user_agent(USER_AGENT)
+        .user_agent(
+            std::env::var("LIBREFANG_USER_AGENT").unwrap_or_else(|_| crate::USER_AGENT.to_string()),
+        )
         // Default timeouts so the agent loop never hangs forever when an
         // upstream stalls. These are per-request defaults that any caller
         // may override via `.timeout()`, `.connect_timeout()`, etc. on the

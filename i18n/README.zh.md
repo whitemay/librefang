@@ -32,6 +32,15 @@
 
 ---
 
+### fork 版本说明
+
+本 fork 版本与原版保持一致，少数不同的实现列在下面：
+- 通过 LIBREFANG_USER_AGENT 来使用自定义的user-agent请求头。
+- 缺省使用极小编译配置
+- 禁止了Agent对 manifest 文件的修改。
+- 取消了对 Hand 对话的过滤。
+---
+
 ## 什么是 LibreFang？
 
 LibreFang 是一个 **Agent 操作系统** — 用 Rust 从头构建的完整自主 AI 智能体运行平台。不是聊天机器人框架，不是 Python 包装器。
